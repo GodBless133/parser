@@ -1081,19 +1081,58 @@ class TelegramWorkingInvite:
             Toast.show(self.root, "Сессии не найдены", level="warning")
             return
 
-        existing = {(a.account.source_format, a.account.user_id) for a in self.loaded_accounts}
-        added = 0
+        # Фильтруем невалидные аккаунты (где auth_key пустой или StringSession не построилась)
+        valid_accounts = []
+        invalid_count = 0
+        invalid_reasons = []
         for acc in accounts:
+            if acc.is_valid and acc.telethon_string:
+                # Доп. валидация
+                try:
+                    from account_loader import validate_string_session
+                    if validate_string_session(acc.telethon_string):
+                        valid_accounts.append(acc)
+                    else:
+                        invalid_count += 1
+                        invalid_reasons.append(f"{acc.source_format} {acc.display_name}: StringSession невалидна")
+                except ImportError:
+                    valid_accounts.append(acc)
+            else:
+                invalid_count += 1
+                reason = acc.error or "неизвестная причина"
+                invalid_reasons.append(f"{acc.source_format} {acc.display_name}: {reason}")
+
+        if not valid_accounts:
+            msg = "Все найденные сессии невалидны!\n\nПричины:\n"
+            msg += "\n".join(f"• {r}" for r in invalid_reasons[:10])
+            messagebox.showerror("Загрузка", msg)
+            Toast.show(self.root, "Все сессии невалидны", level="error")
+            return
+
+        existing_keys = {(a.account.source_format, a.account.user_id) for a in self.loaded_accounts}
+        added = 0
+        for acc in valid_accounts:
             key = (acc.source_format, acc.user_id)
-            if key in existing:
+            if key in existing_keys:
                 continue
             self.loaded_accounts.append(AccountRuntimeInfo(account=acc))
-            existing.add(key)
+            existing_keys.add(key)
             added += 1
 
-        self.log_message(f"✅ Загружено: {added} (всего: {len(self.loaded_accounts)})", "success")
+        msg = f"✅ Загружено валидных аккаунтов: {added}"
+        if invalid_count:
+            msg += f"\n⚠️ Пропущено невалидных: {invalid_count}"
+        self.log_message(msg, "success" if not invalid_count else "warning")
+
+        if invalid_count:
+            self.log_message("Причины пропуска:", "warning")
+            for r in invalid_reasons[:5]:
+                self.log_message(f"  • {r}", "warning")
+
         Toast.show(self.root, "Аккаунты загружены",
-                   f"Добавлено: {added}\nВсего: {len(self.loaded_accounts)}", "success")
+                   f"Добавлено: {added}\nВсего: {len(self.loaded_accounts)}"
+                   + (f"\nПропущено: {invalid_count}" if invalid_count else ""),
+                   "success" if not invalid_count else "warning")
         self.refresh_accounts_table()
 
         if messagebox.askyesno("Подключение",
@@ -1185,9 +1224,38 @@ class TelegramWorkingInvite:
                 await info.client.disconnect()
             except Exception:
                 pass
+
+        # ВАЛИДАЦИЯ StringSession перед созданием клиента
+        # (критично — иначе Telethon бросит "Not a valid string")
+        session_str = info.account.telethon_string
+        if not session_str:
+            info.is_connected = False
+            info.is_authorized = False
+            info.last_error = "Пустая StringSession (auth_key невалиден)"
+            self.log_invite(
+                f"❌ [{info.account.display_name}] Пропуск: {info.last_error}",
+                "error",
+            )
+            return
+
+        # Доп. валидация
+        try:
+            from account_loader import validate_string_session
+            if not validate_string_session(session_str):
+                info.is_connected = False
+                info.is_authorized = False
+                info.last_error = "StringSession невалидна"
+                self.log_invite(
+                    f"❌ [{info.account.display_name}] Невалидная сессия",
+                    "error",
+                )
+                return
+        except ImportError:
+            pass  # модуль недоступен — продолжаем без доп. проверки
+
         proxy = self._build_proxy()
         kwargs = dict(
-            session=StringSession(info.account.telethon_string),
+            session=StringSession(session_str),
             api_id=int(self.api_id), api_hash=self.api_hash,
             device_model="Desktop", system_version="Windows 10",
             app_version=self.VERSION, lang_code="ru", system_lang_code="ru",
@@ -1195,8 +1263,23 @@ class TelegramWorkingInvite:
         )
         if proxy:
             kwargs["proxy"] = proxy
-        info.client = TelegramClient(**kwargs)
-        await info.client.connect()
+
+        try:
+            info.client = TelegramClient(**kwargs)
+            await info.client.connect()
+        except ValueError as e:
+            # "Not a valid string" или похожие
+            info.is_connected = False
+            info.is_authorized = False
+            info.last_error = f"Невалидная сессия: {e}"
+            logger.error(f"Ошибка создания клиента для {info.account.display_name}: {e}")
+            return
+        except Exception as e:
+            info.is_connected = False
+            info.is_authorized = False
+            info.last_error = f"Ошибка подключения: {str(e)[:80]}"
+            logger.error(f"Ошибка подключения {info.account.display_name}: {e}")
+            return
         if not info.client.is_connected():
             info.is_connected = False
             info.is_authorized = False
@@ -2601,11 +2684,18 @@ class TelegramWorkingInvite:
                     accounts_pool = [info]
                     break
             if not accounts_pool and self.client and self.is_authenticated:
+                # Для ручной авторизации создаём временный AccountRuntimeInfo
+                # с Already-Connected клиентом (StringSession не нужна)
                 tmp = AccountRuntimeInfo(account=LoadedAccount(
-                    auth_key=b"\x00" * 256, dc_id=2, source_format="manual"))
+                    auth_key=bytes(random.randint(1, 255) for _ in range(256)),
+                    dc_id=2,
+                    source_format="manual",
+                    telethon_string="",  # не используем — клиент уже подключён
+                ))
                 tmp.client = self.client
                 tmp.is_connected = True
                 tmp.is_authorized = True
+                tmp.me_name = "Ручная авторизация"
                 accounts_pool = [tmp]
 
         if not accounts_pool:

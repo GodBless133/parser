@@ -88,12 +88,22 @@ class LoadedAccount:
     error: str = ""
 
     def __post_init__(self) -> None:
-        if not self.telethon_string and self.auth_key and self.dc_id:
+        # Не пытаемся строить StringSession, если auth_key пустой/нулевой
+        # (это бывает для fallback-аккаунтов при ручной авторизации)
+        if not self.telethon_string and self.auth_key and len(self.auth_key) == 256 and any(self.auth_key):
             try:
                 self.telethon_string = make_string_session(self.auth_key, self.dc_id)
             except Exception as e:
                 self.is_valid = False
                 self.error = f"Не удалось построить StringSession: {e}"
+                logger.warning(f"StringSession build failed for {self.source_path}: {e}")
+        elif self.auth_key and (len(self.auth_key) != 256 or not any(self.auth_key)):
+            self.is_valid = False
+            self.error = (
+                f"auth_key невалиден (длина={len(self.auth_key)}, "
+                f"все нули={not any(self.auth_key)})"
+            )
+            logger.warning(f"Invalid auth_key for {self.source_path}: {self.error}")
         if not self.display_name:
             if self.phone:
                 self.display_name = self.phone
@@ -104,38 +114,93 @@ class LoadedAccount:
 
 
 # =====================================================================
-# StringSession builder
+# StringSession builder  (Telethon 1.34+ format)
 # =====================================================================
 def make_string_session(auth_key: bytes, dc_id: int) -> str:
     """Строит Telethon StringSession из auth_key + dc_id.
 
-    Формат (Telethon v1):
-        '1' (1 байт — версия)
-        + dc_id (1 байт)
-        + len(server_address) (int32 BE)
-        + server_address (utf-8)
-        + port (int32 BE)
-        + auth_key (256 байт)
-        → base64 urlsafe
+    ФОРМАТ Telethon 1.34+ (актуальный для 1.44):
 
-    Это позволяет использовать любую сессию (включая TData и Pyrogram)
-    напрямую в Telethon без конвертации файлов.
+        Структура struct.pack('>B{}sH256s', ...):
+          - B  = dc_id          (1 байт, unsigned char)
+          - {}s = IP-адрес      (4 байта для IPv4 / 16 для IPv6 — packed bytes)
+          - H  = port           (2 байта, unsigned short, big-endian)
+          - 256s = auth_key     (256 байт)
+
+        Полная строка: '1' + base64_urlsafe(packed)
+
+        Telethon определяет IPv4 vs IPv6 по длине декодированных данных:
+            len == 352 (после base64) → IPv4 (4 байта IP)
+            иначе → IPv6 (16 байт IP)
+
+    Старый формат (с int32 длиной адреса + utf-8 строкой) БОЛЬШЕ НЕ РАБОТАЕТ
+    в Telethon 1.34+ — вызывал ошибку "Not a valid string".
     """
-    if len(auth_key) != 256:
-        raise ValueError(f"auth_key должен быть 256 байт, получено {len(auth_key)}")
+    import ipaddress
+
+    # Валидация auth_key
+    if not auth_key or len(auth_key) != 256:
+        raise ValueError(
+            f"auth_key должен быть 256 байт, получено {len(auth_key) if auth_key else 0}"
+        )
+    # Telethon проверяет `if any(key)` — если все нули, ключ считается невалидным
+    if not any(auth_key):
+        raise ValueError("auth_key состоит только из нулей — невалиден")
+
     if dc_id not in DC_MAP:
         logger.warning(f"Неизвестный dc_id={dc_id}, использую DC2")
         dc_id = 2
     server, port = DC_MAP[dc_id]
-    server_bytes = server.encode("utf-8")
-    with BytesIO() as out:
-        out.write(b"1")                                  # версия
-        out.write(bytes([dc_id]))                        # dc_id
-        out.write(struct.pack(">i", len(server_bytes)))  # длина адреса
-        out.write(server_bytes)                          # адрес
-        out.write(struct.pack(">i", port))               # порт
-        out.write(auth_key)                              # auth_key
-        return base64.urlsafe_b64encode(out.getvalue()).decode("ascii")
+
+    # IP-адрес как packed bytes (4 байта для IPv4)
+    try:
+        ip_bytes = ipaddress.ip_address(server).packed
+    except ValueError as e:
+        raise ValueError(f"Невалидный IP-адрес {server}: {e}")
+
+    # Pack: >B{len}sH256s
+    # B = dc_id (1), {}s = ip (4 для IPv4), H = port (2), 256s = auth_key
+    packed = struct.pack(
+        f">B{len(ip_bytes)}sH256s",
+        dc_id,
+        ip_bytes,
+        port,
+        auth_key,
+    )
+
+    # base64 urlsafe кодировка + префикс версии
+    encoded = base64.urlsafe_b64encode(packed).decode("ascii")
+    return "1" + encoded
+
+
+def validate_string_session(session_str: str) -> bool:
+    """Проверить, что строка StringSession валидна для текущей версии Telethon.
+
+    Используется для раннего обнаружения проблем перед созданием клиента.
+    """
+    if not session_str or not session_str.startswith("1"):
+        return False
+    try:
+        import ipaddress
+        # Декодируем
+        raw = base64.urlsafe_b64decode(session_str[1:])
+        # Длина: 1 (dc) + 4 (IPv4) или 16 (IPv6) + 2 (port) + 256 (auth_key)
+        # = 263 для IPv4, 275 для IPv6
+        if len(raw) not in (263, 275):
+            return False
+        ip_len = 4 if len(raw) == 263 else 16
+        dc_id, ip, port, key = struct.unpack(f">B{ip_len}sH256s", raw)
+        # Проверки
+        if not (1 <= dc_id <= 5):
+            return False
+        ipaddress.ip_address(ip)  # бросит исключение если невалидный
+        if not (1 <= port <= 65535):
+            return False
+        if not any(key):
+            return False
+        return True
+    except Exception:
+        return False
 
 
 # =====================================================================
