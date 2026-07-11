@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+
+# PyInstaller
+*.manifest
+*.spec.bak
+
+# Virtual environments
+venv/
+env/
+.venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Application data (НЕ коммитить — пользовательские данные)
+config/
+sessions/
+logs/
+backups/
+accounts/
+*.session
+*.session-journal
+*.key
+blacklist.txt
+autosave.json
+invite_state.json
+
+# Бинари (слишком большие для git)
+TelegramInviterPro
+TelegramInviterPro.exe
+TelegramInviterPro_Linux
+*.exe
+*.dll
+
+# Временные файлы
+*.tmp
+*.bak
+*.log
