@@ -63,15 +63,46 @@ from telethon.errors import (
     SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError,
     ApiIdInvalidError, AuthKeyDuplicatedError, AuthKeyUnregisteredError,
     UserBotError, PeerFloodError,
-    # Permission errors при инвайте:
-    ChatWriteForbiddenError,      # "You can't write in this chat"
-    ChatAdminInviteRequiredError, # нужно быть админом
-    BroadcastForbiddenError,      # это broadcast-канал
-    InviteForbiddenWithJoinasError,
-    UserAlreadyInvitedError,
-    UserPrivacyInvalidError,
-    InputUserDeactivatedError,
 )
+
+# Опциональные импорты ошибок — некоторые существуют только в новых версиях Telethon.
+# Используем try/except, чтобы не ломать совместимость со старыми версиями.
+ChatWriteForbiddenError = type("ChatWriteForbiddenError", (Exception,), {})
+ChatAdminInviteRequiredError = type("ChatAdminInviteRequiredError", (Exception,), {})
+BroadcastForbiddenError = type("BroadcastForbiddenError", (Exception,), {})
+InviteForbiddenWithJoinasError = type("InviteForbiddenWithJoinasError", (Exception,), {})
+UserAlreadyInvitedError = type("UserAlreadyInvitedError", (Exception,), {})
+UserPrivacyInvalidError = type("UserPrivacyInvalidError", (Exception,), {})
+InputUserDeactivatedError = type("InputUserDeactivatedError", (Exception,), {})
+
+try:
+    from telethon.errors import ChatWriteForbiddenError  # noqa: F811
+except ImportError:
+    pass
+try:
+    from telethon.errors import ChatAdminInviteRequiredError  # noqa: F811
+except ImportError:
+    pass
+try:
+    from telethon.errors import BroadcastForbiddenError  # noqa: F811
+except ImportError:
+    pass
+try:
+    from telethon.errors import InviteForbiddenWithJoinasError  # noqa: F811
+except ImportError:
+    pass
+try:
+    from telethon.errors import UserAlreadyInvitedError  # noqa: F811
+except ImportError:
+    pass
+try:
+    from telethon.errors import UserPrivacyInvalidError  # noqa: F811
+except ImportError:
+    pass
+try:
+    from telethon.errors import InputUserDeactivatedError  # noqa: F811
+except ImportError:
+    pass
 import logging
 from logging.handlers import RotatingFileHandler
 
