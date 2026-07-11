@@ -63,6 +63,14 @@ from telethon.errors import (
     SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError,
     ApiIdInvalidError, AuthKeyDuplicatedError, AuthKeyUnregisteredError,
     UserBotError, PeerFloodError,
+    # Permission errors при инвайте:
+    ChatWriteForbiddenError,      # "You can't write in this chat"
+    ChatAdminInviteRequiredError, # нужно быть админом
+    BroadcastForbiddenError,      # это broadcast-канал
+    InviteForbiddenWithJoinasError,
+    UserAlreadyInvitedError,
+    UserPrivacyInvalidError,
+    InputUserDeactivatedError,
 )
 import logging
 from logging.handlers import RotatingFileHandler
@@ -1109,11 +1117,20 @@ class TelegramWorkingInvite:
             Toast.show(self.root, "Все сессии невалидны", level="error")
             return
 
-        existing_keys = {(a.account.source_format, a.account.user_id) for a in self.loaded_accounts}
+        # ДЕДУПЛИКАЦИЯ по auth_key (а не по user_id — он может быть None у новых Telethon-сессий)
+        # Также учитываем source_path для TData (у них auth_key может совпадать, если из одной установки)
+        import hashlib as _hashlib
+        def _acc_key(acc: LoadedAccount) -> tuple:
+            # Хэш auth_key + формат — уникальный идентификатор аккаунта
+            auth_hash = _hashlib.md5(acc.auth_key).hexdigest() if acc.auth_key and any(acc.auth_key) else ""
+            return (acc.source_format, auth_hash, acc.source_path)
+
+        existing_keys = {_acc_key(a.account) for a in self.loaded_accounts}
         added = 0
         for acc in valid_accounts:
-            key = (acc.source_format, acc.user_id)
+            key = _acc_key(acc)
             if key in existing_keys:
+                # Уже загружен этот аккаунт — пропускаем
                 continue
             self.loaded_accounts.append(AccountRuntimeInfo(account=acc))
             existing_keys.add(key)

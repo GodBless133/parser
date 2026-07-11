@@ -639,8 +639,8 @@ class AccountLoader:
             self.errors.append(f"Не удалось прочитать папку: {e}")
             return []
 
-        # Рекурсивно обходим (но не глубже 2 уровней для TData)
-        self._scan_dir(folder, max_depth=2)
+        # Рекурсивно обходим (до 5 уровней — находит сессии в подпапках)
+        self._scan_dir(folder, max_depth=5)
 
         logger.info(
             f"Сканирование {folder}: найдено {len(self.accounts)} аккаунтов, "
@@ -648,8 +648,12 @@ class AccountLoader:
         )
         return self.accounts
 
-    def _scan_dir(self, folder: Path, depth: int = 0, max_depth: int = 2) -> None:
-        """Рекурсивное сканирование с ограничением глубины."""
+    def _scan_dir(self, folder: Path, depth: int = 0, max_depth: int = 5) -> None:
+        """Рекурсивное сканирование с ограничением глубины.
+
+        Глубина увеличена до 5 — чтобы находить сессии в подпапках вроде
+        accounts/user1/sessions/account.session
+        """
         if depth > max_depth:
             return
 
@@ -663,12 +667,17 @@ class AccountLoader:
                 continue
 
             try:
-                if entry.is_file() and entry.suffix.lower() == ".session":
-                    acc = self._try_load_session_file(entry)
-                    if acc:
-                        self.accounts.append(acc)
-                    else:
-                        self.errors.append(f"Не распознан формат: {entry}")
+                if entry.is_file():
+                    # Проверяем файлы с любым расширением или без него
+                    # (раньше только .session, но пользователи называют как угодно)
+                    if self._is_likely_session_file(entry):
+                        acc = self._try_load_session_file(entry)
+                        if acc:
+                            self.accounts.append(acc)
+                        else:
+                            # Только сообщаем об ошибке, если файл похож на сессию
+                            # (SQLite с таблицей sessions), но не загрузился
+                            pass
                 elif entry.is_dir():
                     # Это TData?
                     tdata_path = self._detect_tdata(entry)
@@ -686,8 +695,53 @@ class AccountLoader:
             except Exception as e:
                 self.errors.append(f"Ошибка при обработке {entry}: {e}")
 
+    def _is_likely_session_file(self, path: Path) -> bool:
+        """Быстрая проверка, является ли файл SQLite-сессией.
+
+        Проверяем:
+          1. Расширение .session (классический Telethon/Pyrogram)
+          2. Файл начинается с магических байт SQLite ('SQLite format 3\\x00')
+          3. Файл не слишком большой (< 10MB — сессии маленькие)
+
+        Это позволяет находить сессии с любым расширением (.db, .sqlite, без него).
+        """
+        # Расширение .session — сразу да
+        if path.suffix.lower() == ".session":
+            return True
+
+        # Пропускаем скрытые файлы и служебные
+        if path.name.startswith(".") or path.name in ("key_datas", "map", "usertag"):
+            return False
+
+        # Пропускаем слишком большие файлы (сессии < 10MB)
+        try:
+            size = path.stat().st_size
+        except Exception:
+            return False
+        if size < 1024:  # слишком маленький — точно не сессия
+            return False
+        if size > 10 * 1024 * 1024:  # > 10MB — не сессия
+            return False
+
+        # Проверяем магические байты SQLite: 'SQLite format 3\x00'
+        try:
+            with open(path, "rb") as f:
+                header = f.read(16)
+            if header.startswith(b"SQLite format 3"):
+                return True
+        except Exception:
+            pass
+
+        return False
+
     def _try_load_session_file(self, path: Path) -> Optional[LoadedAccount]:
-        """Попытаться загрузить .session файл (сначала Telethon, затем Pyrogram)."""
+        """Попытаться загрузить .session файл (сначала Telethon, затем Pyrogram).
+
+        Telethon ВСЕГДА проверяется первым — это правильно, потому что:
+          - Telethon-сессия НЕ имеет колонок api_id/user_id в таблице sessions
+          - Pyrogram-запрос к Telethon-сессии упадёт с OperationalError
+          - Поэтому порядок Telethon→Pyrogram корректен
+        """
         # Telethon
         acc = load_telethon_session(path)
         if acc:
