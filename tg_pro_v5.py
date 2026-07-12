@@ -3323,6 +3323,39 @@ class TelegramWorkingInvite:
             self.log_invite(f"❌ Не удалось получить группу: {e}", "error")
             return
 
+        # [NEW] Получаем InputChannel для InviteToChannelRequest
+        # В Telethon 1.34+ InviteToChannelRequest требует TypeInputChannel,
+        # а не Channel/Chat — иначе ошибка "Invalid channel object".
+        try:
+            input_channel = await primary.client.get_input_entity(group)
+        except Exception as e:
+            self.log_invite(f"❌ Не удалось получить InputChannel: {e}", "error")
+            return
+
+        # Нормализуем в InputChannel (с channel_id + access_hash)
+        # Это работает для всех аккаунтов — не зависит от кэша сессии
+        from telethon.tl.types import (
+            InputChannel as TlInputChannel,
+            InputPeerChannel as TlInputPeerChannel,
+        )
+        if isinstance(input_channel, TlInputPeerChannel):
+            # Преобразуем InputPeerChannel → InputChannel
+            input_channel = TlInputChannel(
+                channel_id=input_channel.channel_id,
+                access_hash=input_channel.access_hash,
+            )
+            self.log_invite(f"✅ InputChannel получен (id={input_channel.channel_id})", "info")
+        elif isinstance(input_channel, TlInputChannel):
+            self.log_invite(f"✅ InputChannel получен (id={input_channel.channel_id})", "info")
+        else:
+            # Для обычных чатов (Chat) нужен другой подход — через InputPeerChat
+            self.log_invite(
+                f"⚠️ Целевая группа — это обычный чат (не супергруппа/канал). "
+                f"Инвайт работает только в супергруппы/каналы. "
+                f"Тип: {type(input_channel).__name__}",
+                "warning",
+            )
+
         # [NEW] Проверка типа группы и прав аккаунта
         await self._check_group_permissions(primary.client, group, primary)
 
@@ -3424,7 +3457,7 @@ class TelegramWorkingInvite:
                     consecutive_errors = max(0, consecutive_errors - 1)
                     continue
 
-                await client(InviteToChannelRequest(channel=group, users=[user_entity]))
+                await client(InviteToChannelRequest(channel=input_channel, users=[user_entity]))
                 self.stats.successful += 1
                 info.invited_count += 1
                 user.status = "✅ Приглашён"
@@ -3495,10 +3528,25 @@ class TelegramWorkingInvite:
                 break
             except Exception as e:
                 err_str = str(e)
+                err_lower = err_str.lower()
                 # Обрабатываем "You can't write in this chat" как ChatWriteForbidden
-                if "can't write in this chat" in err_str.lower():
+                if "can't write in this chat" in err_lower:
                     self._handle_invite_error(
                         user, info, "Нет прав", "у аккаунта нет прав приглашать"
+                    )
+                    consecutive_errors += 1
+                # [NEW] "Invalid channel object" — нужно использовать InputChannel
+                elif "invalid channel object" in err_lower:
+                    self._handle_invite_error(
+                        user, info, "Invalid channel",
+                        "внутренняя ошибка — нужен InputChannel (обновите программу)"
+                    )
+                    consecutive_errors += 1
+                # "Invalid user object" — нужно использовать InputUser
+                elif "invalid user object" in err_lower:
+                    self._handle_invite_error(
+                        user, info, "Invalid user",
+                        "не удалось создать InputUser — нет access_hash"
                     )
                     consecutive_errors += 1
                 else:
