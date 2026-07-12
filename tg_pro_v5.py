@@ -3479,7 +3479,8 @@ class TelegramWorkingInvite:
                 self.stats.skipped += 1
                 self.log_invite(f"⏭️ Уже в группе: {user.username or user.id}", "info")
                 continue
-            if user.status in ("✅ Приглашён", "❌ Ошибка"):
+            if user.status in ("✅ Приглашён", "❌ Ошибка", "❌ Невалидный", "🧪 Dry-run"):
+                # Пропускаем уже обработанных пользователей (включая невалидных)
                 continue
 
             # Выбор аккаунта
@@ -3637,11 +3638,38 @@ class TelegramWorkingInvite:
                         "внутренняя ошибка — нужен InputChannel (обновите программу)"
                     )
                     consecutive_errors += 1
-                # "Invalid user object" — нужно использовать InputUser
-                elif "invalid user object" in err_lower:
+                # "Invalid user object" / "Invalid object ID for a user"
+                elif ("invalid user object" in err_lower
+                      or "invalid object id for a user" in err_lower):
                     self._handle_invite_error(
-                        user, info, "Invalid user",
-                        "не удалось создать InputUser — нет access_hash"
+                        user, info, "Invalid user ID",
+                        "невалидный access_hash — пользователь удалён/заблокирован"
+                    )
+                    # Помечаем пользователя как невалидного — не тратить время снова
+                    user.status = "❌ Невалидный"
+                    user.access_hash = None  # сбрасываем, чтобы не использовать повторно
+                    consecutive_errors += 1
+                # "PEER_ID_INVALID" — другая формулировка той же ошибки
+                elif "peer_id_invalid" in err_lower or "peer id invalid" in err_lower:
+                    self._handle_invite_error(
+                        user, info, "Peer ID invalid",
+                        "пользователь не найден на сервере Telegram"
+                    )
+                    user.status = "❌ Невалидный"
+                    user.access_hash = None
+                    consecutive_errors += 1
+                # "USER_ID_INVALID" — юзер не существует
+                elif "user_id_invalid" in err_lower or "user id invalid" in err_lower:
+                    self._handle_invite_error(
+                        user, info, "User ID invalid",
+                        "пользователь не существует"
+                    )
+                    user.status = "❌ Невалидный"
+                    consecutive_errors += 1
+                # "ChatAdminRequired" / "CHANNEL_PRIVATE"
+                elif "channel_private" in err_lower or "chat admin required" in err_lower:
+                    self._handle_invite_error(
+                        user, info, "Нет прав", "нужны права админа в группе"
                     )
                     consecutive_errors += 1
                 else:
@@ -3776,37 +3804,100 @@ class TelegramWorkingInvite:
             self.log_invite(f"⚠️ Ошибка проверки прав: {e}", "warning")
 
     async def _get_input_user(self, client: TelegramClient, user: UserData):
-        """Получить InputUser для инвайта.
+        """Получить валидный InputUser для инвайта.
 
-        Решает проблему "Could not find the input entity for PeerUser":
-        1. Используем сохранённый access_hash (главный путь)
-        2. Если access_hash есть — создаём InputUser напрямую
-        3. Если нет — пробуем get_input_entity (работает для контактов)
-        4. Если есть username — пробуем через него
-        5. Иначе возвращаем None
+        Решает несколько проблем:
+        1. "Could not find the input entity for PeerUser" — нет access_hash в кэше
+        2. "Invalid object ID for a user" — невалидный/устаревший access_hash
+
+        Стратегия (пробуем по очереди):
+        1. Если есть access_hash — создаём InputUser и валидируем через GetFullUserRequest
+        2. Если есть username — резолвим через @username (получаем свежий access_hash)
+        3. Если есть в кэше сессии — get_input_entity(user.id)
+        4. Возвращаем None
+
+        Дополнительно: обновляем user.access_hash в UserData, если получили новый.
         """
-        from telethon.tl.types import InputUser
-        from telethon.errors import PeerIdInvalidError
+        from telethon.tl.types import InputUser, InputPeerUser
+        from telethon.tl.functions.users import GetFullUserRequest
+        from telethon.errors import (
+            PeerIdInvalidError, UserNotParticipantError,
+            UsernameInvalidError, UsernameOccupiedError,
+            UserDeletedError, UserDeactivatedError,
+            UserDeactivatedBanError, UserPrivacyInvalidError as _UPIE,
+        )
 
-        # Путь 1: есть access_hash — создаём InputUser напрямую
+        # Нормализуем username (убираем @ если есть)
+        username = user.username
+        if username and username.startswith("@"):
+            username = username[1:]
+        if username == "—" or username == "Нет":
+            username = None
+
+        # Путь 1: есть access_hash — создаём InputUser и ВАЛИДИРУЕМ через GetFullUserRequest
         if user.access_hash:
             try:
-                return InputUser(user_id=user.id, access_hash=user.access_hash)
+                input_user = InputUser(user_id=user.id, access_hash=user.access_hash)
+                # Валидация — GetFullUserRequest вернёт ошибку если access_hash невалидный
+                try:
+                    await client(GetFullUserRequest(input_user))
+                    return input_user  # ✅ Валидный
+                except (PeerIdInvalidError, UserDeactivatedError,
+                        UserDeactivatedBanError, UserDeletedError):
+                    # access_hash невалидный — пробуем другие пути
+                    pass
+                except Exception as e:
+                    # Если ошибка не связана с невалидным ID — возвращаем InputUser
+                    err_str = str(e).lower()
+                    if "invalid" not in err_str and "not found" not in err_str:
+                        return input_user
             except Exception:
                 pass
 
-        # Путь 2: пробуем get_input_entity (работает для пользователей в кэше сессии)
+        # Путь 2: резолвим через @username (если есть) — получаем СВЕЖИЙ access_hash
+        if username:
+            try:
+                entity = await client.get_entity(username)
+                if entity and getattr(entity, "id", None) == user.id:
+                    # Совпадает — создаём InputUser с свежим access_hash
+                    access_hash = getattr(entity, "access_hash", None)
+                    if access_hash:
+                        input_user = InputUser(user_id=user.id, access_hash=access_hash)
+                        # Обновляем в UserData для следующих попыток
+                        user.access_hash = int(access_hash)
+                        return input_user
+            except Exception:
+                pass
+
+        # Путь 3: get_input_entity(user.id) — работает если юзер в кэше сессии
         try:
-            return await client.get_input_entity(user.id)
+            input_entity = await client.get_input_entity(user.id)
+            if isinstance(input_entity, InputPeerUser):
+                input_user = InputUser(
+                    user_id=input_entity.user_id,
+                    access_hash=input_entity.access_hash,
+                )
+                # Обновляем access_hash
+                if input_entity.access_hash:
+                    user.access_hash = int(input_entity.access_hash)
+                return input_user
+            elif isinstance(input_entity, InputUser):
+                if input_entity.access_hash:
+                    user.access_hash = int(input_entity.access_hash)
+                return input_entity
         except Exception:
             pass
 
-        # Путь 3: пробуем через username
-        if user.username:
-            try:
-                return await client.get_input_entity(user.username)
-            except Exception:
-                pass
+        # Путь 4: пробуем через get_entity(user.id) — если юзер в кэше
+        try:
+            entity = await client.get_entity(user.id)
+            access_hash = getattr(entity, "access_hash", None)
+            if access_hash:
+                input_user = InputUser(user_id=user.id, access_hash=access_hash)
+                user.access_hash = int(access_hash)
+                return input_user
+        except Exception:
+            pass
 
         # Ничего не сработало
         return None
