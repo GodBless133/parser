@@ -1986,11 +1986,12 @@ class TelegramWorkingInvite:
                 try:
                     entity = await client.get_entity(username)
                     # Проверяем через GetParticipantRequest
+                    # Telethon 1.44: participant вместо user_id
                     from telethon.tl.functions.channels import GetParticipantRequest
                     me = await client.get_me()
                     try:
                         await client(GetParticipantRequest(
-                            channel=entity, user_id=me.id
+                            channel=entity, participant=me.id
                         ))
                         return "success"  # состоит в чате
                     except UserNotParticipantError:
@@ -3771,9 +3772,10 @@ class TelegramWorkingInvite:
                 me = await client.get_me()
 
                 # Используем InputChannel, не group
+                # Telethon 1.44: GetParticipantRequest принимает participant, не user_id
                 channel_param = self._invite_input_channel if self._invite_input_channel else group
                 result = await client(GetParticipantRequest(
-                    channel=channel_param, user_id=me.id
+                    channel=channel_param, participant=me.id
                 ))
                 participant = result.participant
                 is_admin = isinstance(participant, (ChannelParticipantAdmin, ChannelParticipantCreator))
@@ -3905,12 +3907,18 @@ class TelegramWorkingInvite:
         """
         from telethon.tl.types import InputUser, InputPeerUser
         from telethon.tl.functions.users import GetFullUserRequest
+        # Базовые ошибки — есть во всех версиях Telethon
         from telethon.errors import (
             PeerIdInvalidError, UserNotParticipantError,
             UsernameInvalidError, UsernameOccupiedError,
             UserDeletedError, UserDeactivatedError,
-            UserDeactivatedBanError, UserPrivacyInvalidError as _UPIE,
         )
+        # Опциональные — через try/except (могут отсутствовать в старых версиях)
+        UserDeactivatedBanError = type("UserDeactivatedBanError", (Exception,), {})
+        try:
+            from telethon.errors import UserDeactivatedBanError  # noqa: F811
+        except ImportError:
+            pass
 
         # Нормализуем username (убираем @ если есть)
         username = user.username
