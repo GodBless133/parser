@@ -3531,11 +3531,24 @@ class TelegramWorkingInvite:
                     consecutive_errors = max(0, consecutive_errors - 1)
                     continue
 
+                # [NEW] Получаем InputChannel для ЭТОГО аккаунта
+                # access_hash канала тоже сессионный — для каждого аккаунта свой
+                input_channel_for_account = await self._get_input_channel_for_account(
+                    client, info, target_group
+                )
+                if input_channel_for_account is None and self._invite_target_type == "channel":
+                    self._handle_invite_error(
+                        user, info, "Нет канала",
+                        f"не удалось получить InputChannel для аккаунта"
+                    )
+                    consecutive_errors += 1
+                    continue
+
                 # [NEW] Выбираем метод в зависимости от типа группы
-                if self._invite_target_type == "channel" and self._invite_input_channel:
+                if self._invite_target_type == "channel" and input_channel_for_account:
                     # Супергруппа — InviteToChannelRequest
                     await client(InviteToChannelRequest(
-                        channel=self._invite_input_channel,
+                        channel=input_channel_for_account,
                         users=[user_entity],
                     ))
                 elif self._invite_target_type == "chat" and self._invite_chat_id:
@@ -3549,7 +3562,7 @@ class TelegramWorkingInvite:
                 else:
                     self._handle_invite_error(
                         user, info, "Нет цели",
-                        "не определён тип целевой группы"
+                        f"не определён тип целевой группы (type={self._invite_target_type})"
                     )
                     consecutive_errors += 1
                     continue
@@ -3631,12 +3644,15 @@ class TelegramWorkingInvite:
                         user, info, "Нет прав", "у аккаунта нет прав приглашать"
                     )
                     consecutive_errors += 1
-                # [NEW] "Invalid channel object" — нужно использовать InputChannel
+                # [NEW] "Invalid channel object" — access_hash канала невалиден для этого аккаунта
                 elif "invalid channel object" in err_lower:
                     self._handle_invite_error(
                         user, info, "Invalid channel",
-                        "внутренняя ошибка — нужен InputChannel (обновите программу)"
+                        "access_hash канала невалиден для этого аккаунта"
                     )
+                    # Сбрасываем кэш InputChannel для этого аккаунта
+                    if hasattr(info, "_input_channel_cache"):
+                        info._input_channel_cache = None
                     consecutive_errors += 1
                 # "Invalid user object" / "Invalid object ID for a user"
                 elif ("invalid user object" in err_lower
@@ -3802,6 +3818,75 @@ class TelegramWorkingInvite:
 
         except Exception as e:
             self.log_invite(f"⚠️ Ошибка проверки прав: {e}", "warning")
+
+    async def _get_input_channel_for_account(self, client: TelegramClient,
+                                              info: AccountRuntimeInfo,
+                                              target_group: str):
+        """Получить InputChannel для конкретного аккаунта.
+
+        access_hash канала — сессионный, для каждого аккаунта свой.
+        Поэтому нельзя использовать InputChannel от primary аккаунта
+        для других аккаунтов в ротации.
+
+        Кэширует результат в info._input_channel_cache чтобы не повторять запросы.
+        """
+        # Проверяем кэш
+        if not hasattr(info, "_input_channel_cache"):
+            info._input_channel_cache = None
+            info._input_channel_target = None
+
+        # Если уже кэшировали для этой же группы — возвращаем
+        if info._input_channel_cache is not None and info._input_channel_target == target_group:
+            return info._input_channel_cache
+
+        from telethon.tl.types import (
+            InputChannel as TlInputChannel,
+            InputPeerChannel as TlInputPeerChannel,
+            Channel as TlChannel,
+        )
+
+        try:
+            # Получаем entity через этот аккаунт
+            group = await client.get_entity(target_group)
+            if not isinstance(group, TlChannel):
+                # Это не Channel (возможно Chat) — не нужен InputChannel
+                return None
+
+            # Получаем InputPeerChannel
+            input_entity = await client.get_input_entity(group)
+            if isinstance(input_entity, TlInputPeerChannel):
+                input_channel = TlInputChannel(
+                    channel_id=input_entity.channel_id,
+                    access_hash=input_entity.access_hash,
+                )
+            elif isinstance(input_entity, TlInputChannel):
+                input_channel = input_entity
+            else:
+                # Fallback — через group.id + access_hash
+                access_hash = getattr(group, "access_hash", None)
+                if access_hash:
+                    input_channel = TlInputChannel(
+                        channel_id=group.id,
+                        access_hash=access_hash,
+                    )
+                else:
+                    self.log_invite(
+                        f"⚠️ [{info.me_name or 'account'}] Не удалось получить access_hash канала",
+                        "warning",
+                    )
+                    return None
+
+            # Кэшируем
+            info._input_channel_cache = input_channel
+            info._input_channel_target = target_group
+            return input_channel
+
+        except Exception as e:
+            self.log_invite(
+                f"⚠️ [{info.me_name or 'account'}] Ошибка получения InputChannel: {e}",
+                "warning",
+            )
+            return None
 
     async def _get_input_user(self, client: TelegramClient, user: UserData):
         """Получить валидный InputUser для инвайта.
