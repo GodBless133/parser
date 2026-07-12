@@ -689,6 +689,7 @@ class TelegramWorkingInvite:
         self.notebook.pack(fill="both", expand=True)
 
         self.setup_accounts_tab(self.notebook)
+        self.setup_chats_tab(self.notebook)  # [NEW] Зайти в чат
         self.setup_auth_tab(self.notebook)
         self.setup_api_tab(self.notebook)
         self.setup_parser_tab(self.notebook)
@@ -1460,6 +1461,556 @@ class TelegramWorkingInvite:
                 continue
             result.append(info)
         return result
+
+    # =====================================================================
+    # ВКЛАДКА: Чаты (зайти / выйти / посмотреть)
+    # =====================================================================
+    def setup_chats_tab(self, notebook: ttk.Notebook) -> None:
+        """Вкладка для массового входа/выхода из чатов всеми аккаунтами.
+
+        Поддерживаемые форматы ссылок:
+          - Публичные:  t.me/username, https://t.me/username, @username
+          - Приватные:  t.me/+AbCdEf, https://t.me/+AbCdEf, t.me/joinchat/AbCdEf
+        """
+        cf = tk.Frame(notebook, bg=Theme.BG_BASE)
+        notebook.add(cf, text="  🚪  Чаты  ")
+
+        # Header
+        header = tk.Frame(cf, bg=Theme.BG_BASE)
+        header.pack(fill="x", padx=14, pady=(10, 6))
+        tk.Label(header, text="🚪 Вход в чаты всеми аккаунтами",
+                 font=Theme.FONT_H1, bg=Theme.BG_BASE,
+                 fg=Theme.TEXT_PRIMARY).pack(anchor="w")
+        tk.Label(header,
+                 text="Массовый вход/выход из чатов. Поддерживаются публичные и приватные ссылки.\n"
+                      "Задержка между аккаунтами снижает риск FloodWait и бана.",
+                 font=Theme.FONT_SMALL, bg=Theme.BG_BASE,
+                 fg=Theme.TEXT_SECONDARY, justify="left").pack(anchor="w", pady=(2, 0))
+
+        # Настройки
+        settings = tk.LabelFrame(cf, text="  Настройки  ", font=Theme.FONT_H2,
+                                 bg=Theme.BG_BASE, fg=Theme.ACCENT_SECONDARY,
+                                 bd=1, relief="solid")
+        settings.pack(fill="x", padx=14, pady=8)
+
+        link_row = tk.Frame(settings, bg=Theme.BG_BASE)
+        link_row.pack(fill="x", padx=12, pady=8)
+        tk.Label(link_row, text="Ссылка на чат:", width=15, anchor="w",
+                 font=Theme.FONT_BODY, bg=Theme.BG_BASE,
+                 fg=Theme.TEXT_PRIMARY).pack(side="left")
+        self.chat_link_entry = tk.Entry(link_row, width=45, font=Theme.FONT_BODY,
+                                         bg=Theme.BG_INPUT, fg=Theme.TEXT_PRIMARY,
+                                         insertbackground=Theme.ACCENT_PRIMARY,
+                                         relief="flat", highlightthickness=2,
+                                         highlightbackground=Theme.BORDER,
+                                         highlightcolor=Theme.ACCENT_PRIMARY)
+        self.chat_link_entry.pack(side="left", padx=4)
+        # Подсказка с примерами
+        tk.Label(link_row, text="Примеры: t.me/username  •  t.me/+AbCdEf  •  @username",
+                 font=Theme.FONT_SMALL, bg=Theme.BG_BASE,
+                 fg=Theme.TEXT_MUTED).pack(side="left", padx=(8, 4))
+
+        # Опции входа
+        opts_row = tk.LabelFrame(settings, text="  Опции  ", font=Theme.FONT_H2,
+                                  bg=Theme.BG_BASE, fg=Theme.ACCENT_SECONDARY,
+                                  bd=1, relief="solid")
+        opts_row.pack(fill="x", padx=12, pady=8)
+
+        opts_inner = tk.Frame(opts_row, bg=Theme.BG_BASE)
+        opts_inner.pack(fill="x", padx=12, pady=8)
+
+        tk.Label(opts_inner, text="Задержка между аккаунтами (сек):",
+                 font=Theme.FONT_BODY, bg=Theme.BG_BASE,
+                 fg=Theme.TEXT_PRIMARY).grid(row=0, column=0, padx=4, pady=6, sticky="w")
+        self.chat_join_delay = tk.Entry(opts_inner, width=6, font=Theme.FONT_BODY,
+                                         bg=Theme.BG_INPUT, fg=Theme.TEXT_PRIMARY,
+                                         insertbackground=Theme.ACCENT_PRIMARY,
+                                         relief="flat", highlightthickness=2,
+                                         highlightbackground=Theme.BORDER,
+                                         highlightcolor=Theme.ACCENT_PRIMARY)
+        self.chat_join_delay.insert(0, "45")
+        self.chat_join_delay.grid(row=0, column=1, padx=4, pady=6)
+
+        self.chat_join_only_active = tk.BooleanVar(value=True)
+        tk.Checkbutton(opts_inner,
+                       text="Только активные аккаунты (пропускать FloodWait/отключённые)",
+                       variable=self.chat_join_only_active,
+                       bg=Theme.BG_BASE, fg=Theme.TEXT_PRIMARY,
+                       selectcolor=Theme.BG_INPUT, activebackground=Theme.BG_BASE,
+                       activeforeground=Theme.TEXT_PRIMARY,
+                       font=Theme.FONT_SMALL).grid(row=1, column=0, columnspan=3,
+                                                    sticky="w", pady=4)
+
+        self.chat_join_skip_joined = tk.BooleanVar(value=True)
+        tk.Checkbutton(opts_inner,
+                       text="Пропускать аккаунты, уже состоящие в чате",
+                       variable=self.chat_join_skip_joined,
+                       bg=Theme.BG_BASE, fg=Theme.TEXT_PRIMARY,
+                       selectcolor=Theme.BG_INPUT, activebackground=Theme.BG_BASE,
+                       activeforeground=Theme.TEXT_PRIMARY,
+                       font=Theme.FONT_SMALL).grid(row=2, column=0, columnspan=3,
+                                                    sticky="w", pady=2)
+
+        # Кнопки управления
+        btn_row = tk.Frame(settings, bg=Theme.BG_BASE)
+        btn_row.pack(fill="x", padx=12, pady=10)
+
+        AnimatedButton(btn_row, text="Войти в чат", icon="🚪",
+                       command=self.join_chat_all_accounts,
+                       bg=Theme.ACCENT_GREEN, hover_bg="#5dd674",
+                       width=170).pack(side="left", padx=4)
+        AnimatedButton(btn_row, text="Выйти из чата", icon="🚪←",
+                       command=self.leave_chat_all_accounts,
+                       bg=Theme.ACCENT_ORANGE, hover_bg="#ffbd77",
+                       width=170).pack(side="left", padx=4)
+        AnimatedButton(btn_row, text="Проверить статус", icon="🔍",
+                       command=self.check_chat_membership,
+                       bg=Theme.ACCENT_BLUE, hover_bg="#7ab8ff",
+                       width=180).pack(side="left", padx=4)
+
+        # Прогресс
+        self.chat_progress_var = tk.DoubleVar(value=0)
+        self.chat_progress = AnimatedProgress(settings, width=600, height=8)
+        self.chat_progress.pack(fill="x", padx=12, pady=(0, 8))
+
+        # Лог чатов
+        log_frame = tk.LabelFrame(cf, text="  📝 Лог операций  ",
+                                  font=Theme.FONT_H2, bg=Theme.BG_BASE,
+                                  fg=Theme.ACCENT_SECONDARY, bd=1, relief="solid")
+        log_frame.pack(fill="both", expand=True, padx=14, pady=(6, 12))
+
+        self.chat_log, chat_sb = styled_scrolledtext(log_frame, height=12,
+                                                      font=Theme.FONT_MONO_SMALL)
+        self.chat_log.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
+        chat_sb.pack(side="right", fill="y", pady=8)
+        for tag, color in {
+            "success": Theme.ACCENT_GREEN, "error": Theme.ACCENT_RED,
+            "warning": Theme.ACCENT_ORANGE, "info": Theme.TEXT_PRIMARY,
+        }.items():
+            self.chat_log.tag_config(tag, foreground=color)
+        self.chat_log.insert("1.0", "Лог операций с чатами:\n" + "=" * 50 + "\n")
+
+        # Сводка
+        self.chat_summary = tk.Label(cf, text="", font=Theme.FONT_SMALL,
+                                      bg=Theme.BG_BASE, fg=Theme.TEXT_SECONDARY)
+        self.chat_summary.pack(fill="x", padx=14, pady=(0, 8))
+
+    def _log_chat(self, message: str, level: str = "info") -> None:
+        """Логирование во вкладку Чаты — потокобезопасно."""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_entry = f"[{timestamp}] {message}\n"
+
+        def _append():
+            self.chat_log.insert(tk.END, log_entry)
+            start = self.chat_log.index("end-1c linestart")
+            end = self.chat_log.index("end-1c linestart")
+            if level in ("info", "success", "warning", "error"):
+                self.chat_log.tag_add(level, start, end)
+            self.chat_log.see(tk.END)
+
+        try:
+            self.root.after(0, _append)
+        except RuntimeError:
+            logger.info(message)
+
+    def _parse_chat_link(self, link: str) -> dict:
+        """Разобрать ссылку на чат.
+
+        Возвращает dict с полями:
+          - type: 'public' | 'private'
+          - username: str (для public)
+          - hash: str (для private)
+          - raw: исходная ссылка
+
+        Поддерживаемые форматы:
+          - t.me/username
+          - https://t.me/username
+          - @username
+          - t.me/+AbCdEf
+          - https://t.me/+AbCdEf
+          - t.me/joinchat/AbCdEf
+          - https://t.me/joinchat/AbCdEf
+        """
+        link = link.strip()
+        if not link:
+            return {"type": "invalid", "raw": link, "error": "Пустая ссылка"}
+
+        # Убираем протокол
+        clean = link
+        for proto in ("https://", "http://", "www."):
+            if clean.lower().startswith(proto):
+                clean = clean[len(proto):]
+                break
+
+        # @username
+        if clean.startswith("@"):
+            return {"type": "public", "username": clean[1:], "raw": link}
+
+        # t.me/+hash (приватный)
+        if "t.me/+" in clean.lower():
+            hash_part = clean.split("+", 1)[1]
+            return {"type": "private", "hash": hash_part, "raw": link}
+
+        # t.me/joinchat/hash (приватный)
+        if "t.me/joinchat/" in clean.lower():
+            hash_part = clean.split("joinchat/", 1)[1]
+            return {"type": "private", "hash": hash_part, "raw": link}
+
+        # t.me/username (публичный)
+        if "t.me/" in clean.lower():
+            username = clean.split("t.me/", 1)[1].split("/")[0].split("?")[0]
+            if username and not username.startswith("+"):
+                return {"type": "public", "username": username, "raw": link}
+
+        return {"type": "invalid", "raw": link, "error": f"Не распознанный формат: {link}"}
+
+    def join_chat_all_accounts(self) -> None:
+        """Войти в чат всеми активными аккаунтами."""
+        self._mass_chat_operation(action="join")
+
+    def leave_chat_all_accounts(self) -> None:
+        """Выйти из чата всеми активными аккаунтами."""
+        self._mass_chat_operation(action="leave")
+
+    def check_chat_membership(self) -> None:
+        """Проверить, кто из аккаунтов состоит в чате."""
+        self._mass_chat_operation(action="check")
+
+    def _mass_chat_operation(self, action: str) -> None:
+        """Общая логика для join/leave/check.
+
+        action: 'join' | 'leave' | 'check'
+        """
+        # Проверки
+        if not self.api_id or not self.api_hash:
+            messagebox.showerror("Ошибка", "Сначала введите api_id/api_hash!")
+            return
+
+        link = self.chat_link_entry.get().strip()
+        if not link:
+            messagebox.showerror("Ошибка", "Введите ссылку на чат!")
+            return
+
+        parsed = self._parse_chat_link(link)
+        if parsed["type"] == "invalid":
+            messagebox.showerror("Ошибка", f"Неверная ссылка:\n{parsed.get('error', '')}")
+            return
+
+        # Получаем список аккаунтов
+        if self.chat_join_only_active.get():
+            accounts = [info for info in self.loaded_accounts
+                        if info.is_connected and info.is_authorized
+                        and not info.is_disabled
+                        and not (info.flood_until and datetime.now() < info.flood_until)]
+        else:
+            accounts = [info for info in self.loaded_accounts
+                        if info.is_connected and info.is_authorized and not info.is_disabled]
+
+        if not accounts:
+            messagebox.showerror("Ошибка",
+                "Нет активных аккаунтов! Сначала загрузите и подключите аккаунты.")
+            return
+
+        # Валидация задержки
+        try:
+            delay = int(self.chat_join_delay.get())
+            if not (0 <= delay <= 600):
+                raise ValueError()
+        except ValueError:
+            messagebox.showerror("Ошибка", "Задержка должна быть 0..600 сек!")
+            return
+
+        # Подтверждение
+        action_names = {
+            "join": "войти в",
+            "leave": "выйти из",
+            "check": "проверить участие в",
+        }
+        action_verb = action_names.get(action, "обработать")
+        confirm = (f"Вы уверены, что хотите {action_verb} чат ВСЕМИ аккаунтами?\n\n"
+                   f"Аккаунтов: {len(accounts)}\n"
+                   f"Ссылка: {parsed['raw']}\n"
+                   f"Тип: {'публичный' if parsed['type'] == 'public' else 'приватный'}\n"
+                   f"Задержка: {delay} сек\n\n")
+        if action == "join":
+            confirm += ("⚠️ ВНИМАНИЕ:\n"
+                        "• Вход 10+ аккаунтов с одного IP в один чат — подозрительный паттерн\n"
+                        "• Используйте задержку минимум 30-60 сек\n"
+                        "• Рекомендуется прокси/VPN для каждого аккаунта")
+        elif action == "leave":
+            confirm += "⚠️ Выход массовый — необратимая операция."
+        if not messagebox.askyesno("Подтверждение", confirm):
+            return
+
+        # Запускаем в отдельном потоке
+        action_labels = {
+            "join": ("🚪 ВХОД В ЧАТ", "вход"),
+            "leave": ("🚪 ВЫХОД ИЗ ЧАТА", "выход"),
+            "check": ("🔍 ПРОВЕРКА УЧАСТИЯ", "проверка"),
+        }
+        title, _ = action_labels.get(action, (action, action))
+
+        self._log_chat("=" * 50, "info")
+        self._log_chat(f"{title}: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", "info")
+        self._log_chat(f"Ссылка: {parsed['raw']}", "info")
+        self._log_chat(f"Тип: {'публичный' if parsed['type'] == 'public' else 'приватный'}", "info")
+        self._log_chat(f"Аккаунтов: {len(accounts)}", "info")
+        self._log_chat(f"Задержка: {delay} сек", "info")
+        self._log_chat("=" * 50, "info")
+
+        threading.Thread(
+            target=self._mass_chat_thread,
+            args=(action, parsed, accounts, delay),
+            daemon=True,
+        ).start()
+
+    def _mass_chat_thread(self, action: str, parsed: dict,
+                           accounts: List[AccountRuntimeInfo], delay: int) -> None:
+        """Поток выполнения массовой операции с чатом."""
+        try:
+            self._run_coroutine(
+                self._mass_chat_coroutine(action, parsed, accounts, delay),
+                timeout=86400,  # 24 часа максимум
+            )
+        except Exception as e:
+            self._log_chat(f"❌ Критическая ошибка: {e}", "error")
+        finally:
+            self.root.after(0, lambda: self.chat_progress.set_value(0))
+
+    async def _mass_chat_coroutine(self, action: str, parsed: dict,
+                                    accounts: List[AccountRuntimeInfo], delay: int) -> None:
+        """Корутина массовой операции с чатом."""
+        total = len(accounts)
+        success = 0
+        failed = 0
+        skipped = 0
+        already = 0
+
+        for i, info in enumerate(accounts):
+            label = info.me_name or info.account.display_name
+            self._log_chat(f"🔄 [{i+1}/{total}] {label}...", "info")
+            self.root.after(0, lambda p=((i)/total)*100: self.chat_progress.set_value(p))
+
+            try:
+                result = await self._chat_operation_single(
+                    info.client, action, parsed, info
+                )
+                if result == "success":
+                    success += 1
+                    if action == "join":
+                        self._log_chat(f"✅ [{label}] Вошёл в чат", "success")
+                    elif action == "leave":
+                        self._log_chat(f"✅ [{label}] Вышел из чата", "success")
+                    elif action == "check":
+                        self._log_chat(f"✅ [{label}] В чате", "success")
+                elif result == "already":
+                    already += 1
+                    if action == "join":
+                        self._log_chat(f"⏭️ [{label}] Уже в чате — пропуск", "info")
+                    elif action == "leave":
+                        self._log_chat(f"⏭️ [{label}] Не в чате — пропуск", "info")
+                elif result == "not_member":
+                    if action == "check":
+                        self._log_chat(f"ℹ️ [{label}] Не состоит в чате", "info")
+                        skipped += 1
+                    else:
+                        skipped += 1
+                elif result == "skipped":
+                    skipped += 1
+                else:
+                    failed += 1
+
+            except FloodWaitError as e:
+                wait_time = max(1, e.seconds)
+                info.flood_until = datetime.now() + timedelta(seconds=wait_time)
+                self._log_chat(f"⏳ [{label}] FloodWait: {wait_time}с", "warning")
+                failed += 1
+                self.root.after(0, self.refresh_accounts_table)
+            except ChannelPrivateError:
+                self._log_chat(f"❌ [{label}] Чат приватный или нет доступа", "error")
+                failed += 1
+            except Exception as e:
+                err_str = str(e)[:120]
+                self._log_chat(f"❌ [{label}] Ошибка: {err_str}", "error")
+                failed += 1
+
+            # Задержка перед следующим аккаунтом (кроме последнего)
+            if i < total - 1 and delay > 0:
+                self.root.after(
+                    0, lambda d=delay: self.progress_label.config(
+                        text=f"Ожидание {d}с перед следующим аккаунтом..."
+                    )
+                )
+                waited = 0
+                while waited < delay:
+                    await asyncio.sleep(min(2, delay - waited))
+                    waited += 2
+
+        # Финал
+        self.root.after(0, lambda: self.chat_progress.set_value(100))
+        self._log_chat("=" * 50, "info")
+        action_word = {"join": "вход", "leave": "выход", "check": "проверка"}[action]
+        self._log_chat(f"🎯 {action_word.upper()} ЗАВЕРШЁН", "info")
+        self._log_chat(f"✅ Успешно: {success}", "success")
+        if already:
+            self._log_chat(f"⏭️ Уже обработано: {already}", "info")
+        if skipped:
+            self._log_chat(f"ℹ️ Пропущено: {skipped}", "info")
+        self._log_chat(f"❌ Ошибок: {failed}", "error")
+        self._log_chat("=" * 50, "info")
+
+        # Обновляем сводку
+        summary = (f"Последняя операция: {action_word} | "
+                   f"✅ {success} | ⏭️ {already} | ℹ️ {skipped} | ❌ {failed} | "
+                   f"Всего: {total}")
+        self.root.after(0, lambda: self.chat_summary.config(text=summary))
+
+        # Toast
+        if failed == 0:
+            Toast.show(self.root, f"{action_word.capitalize()} завершён",
+                       f"Успешно: {success}/{total}", "success")
+        elif success > 0:
+            Toast.show(self.root, f"{action_word.capitalize()} частично",
+                       f"Успешно: {success}, ошибок: {failed}", "warning")
+        else:
+            Toast.show(self.root, f"{action_word.capitalize()} не удался",
+                       f"Ошибок: {failed}", "error")
+
+    async def _chat_operation_single(self, client: TelegramClient, action: str,
+                                      parsed: dict, info: AccountRuntimeInfo) -> str:
+        """Выполнить операцию для одного аккаунта.
+
+        Returns:
+            'success' — операция выполнена
+            'already' — уже в нужном состоянии (в чате при join / не в чате при leave)
+            'not_member' — не состоит в чате (для check)
+            'skipped' — пропущен по другой причине
+        """
+        from telethon.tl.functions.channels import (
+            JoinChannelRequest, LeaveChannelRequest,
+        )
+        from telethon.tl.functions.messages import (
+            ImportChatInviteRequest, CheckChatInviteRequest,
+            DeleteChatUserRequest,
+        )
+        from telethon.errors import (
+            UserAlreadyParticipantError, InviteHashExpiredError,
+            InviteHashInvalidError, UserNotParticipantError,
+        )
+
+        chat_type = parsed["type"]
+
+        if action == "join":
+            if chat_type == "public":
+                username = parsed["username"]
+                try:
+                    await client(JoinChannelRequest(username))
+                    return "success"
+                except UserAlreadyParticipantError:
+                    return "already"
+                except Exception as e:
+                    # Иногда Telegram бросает общую ошибку — проверим, может уже в чате
+                    if "already" in str(e).lower() or "participant" in str(e).lower():
+                        return "already"
+                    raise
+
+            elif chat_type == "private":
+                hash_code = parsed["hash"]
+                # Сначала проверяем приглашение
+                try:
+                    check_result = await client(CheckChatInviteRequest(hash_code))
+                    # ChatInviteAlready — уже участник
+                    from telethon.tl.types import ChatInviteAlready
+                    if isinstance(check_result, ChatInviteAlready):
+                        return "already"
+                except (InviteHashExpiredError, InviteHashInvalidError) as e:
+                    raise ChannelPrivateError(f"Приглашение невалидно: {e}")
+
+                # Импортируем приглашение (входим)
+                try:
+                    await client(ImportChatInviteRequest(hash_code))
+                    return "success"
+                except UserAlreadyParticipantError:
+                    return "already"
+                except Exception as e:
+                    if "already" in str(e).lower() or "participant" in str(e).lower():
+                        return "already"
+                    raise
+
+        elif action == "leave":
+            if chat_type == "public":
+                username = parsed["username"]
+                try:
+                    # Get entity first to check membership
+                    entity = await client.get_entity(username)
+                    await client(LeaveChannelRequest(entity))
+                    return "success"
+                except UserNotParticipantError:
+                    return "already"
+                except Exception as e:
+                    err_str = str(e).lower()
+                    if "not participant" in err_str or "not a member" in err_str:
+                        return "already"
+                    raise
+
+            elif chat_type == "private":
+                # Для приватных чатов нужно сначала получить entity через hash
+                hash_code = parsed["hash"]
+                try:
+                    check_result = await client(CheckChatInviteRequest(hash_code))
+                    from telethon.tl.types import ChatInviteAlready
+                    if isinstance(check_result, ChatInviteAlready):
+                        chat = check_result.chat
+                        await client(DeleteChatUserRequest(
+                            chat_id=chat.id, user_id="me"
+                        ))
+                        return "success"
+                    else:
+                        # Не участник — приглашение ещё активно
+                        return "already"
+                except UserNotParticipantError:
+                    return "already"
+                except Exception as e:
+                    err_str = str(e).lower()
+                    if "not participant" in err_str or "not a member" in err_str:
+                        return "already"
+                    raise
+
+        elif action == "check":
+            if chat_type == "public":
+                username = parsed["username"]
+                try:
+                    entity = await client.get_entity(username)
+                    # Проверяем через GetParticipantRequest
+                    from telethon.tl.functions.channels import GetParticipantRequest
+                    me = await client.get_me()
+                    try:
+                        await client(GetParticipantRequest(
+                            channel=entity, user_id=me.id
+                        ))
+                        return "success"  # состоит в чате
+                    except UserNotParticipantError:
+                        return "not_member"
+                except Exception as e:
+                    # Если не можем получить entity — возможно приватный или удалён
+                    err_str = str(e).lower()
+                    if "private" in err_str or "forbidden" in err_str:
+                        return "not_member"
+                    raise
+
+            elif chat_type == "private":
+                hash_code = parsed["hash"]
+                try:
+                    check_result = await client(CheckChatInviteRequest(hash_code))
+                    from telethon.tl.types import ChatInviteAlready
+                    if isinstance(check_result, ChatInviteAlready):
+                        return "success"
+                    else:
+                        return "not_member"
+                except Exception:
+                    return "not_member"
+
+        return "skipped"
 
     # =====================================================================
     # ВКЛАДКА: Ручная авторизация
