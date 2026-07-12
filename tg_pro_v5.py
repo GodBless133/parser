@@ -562,6 +562,10 @@ class TelegramWorkingInvite:
         self.invite_paused: threading.Event = threading.Event()
         self.invite_paused.set()
         self.invite_stop: threading.Event = threading.Event()
+        # [NEW] Целевая группа инвайта — тип и Input-объект
+        self._invite_target_type: Optional[str] = None  # 'channel' | 'chat' | None
+        self._invite_input_channel = None    # InputChannel для супергруппы
+        self._invite_chat_id: Optional[int] = None  # chat_id для обычного чата
         self.auth_phone: str = ""
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.loop_thread: Optional[threading.Thread] = None
@@ -3323,44 +3327,113 @@ class TelegramWorkingInvite:
             self.log_invite(f"❌ Не удалось получить группу: {e}", "error")
             return
 
-        # [NEW] Получаем InputChannel для InviteToChannelRequest
-        # В Telethon 1.34+ InviteToChannelRequest требует TypeInputChannel,
-        # а не Channel/Chat — иначе ошибка "Invalid channel object".
-        try:
-            input_channel = await primary.client.get_input_entity(group)
-        except Exception as e:
-            self.log_invite(f"❌ Не удалось получить InputChannel: {e}", "error")
-            return
-
-        # Нормализуем в InputChannel (с channel_id + access_hash)
-        # Это работает для всех аккаунтов — не зависит от кэша сессии
+        # [NEW] Определяем тип группы и подготавливаем нужный Input-объект
+        # Возможные типы:
+        #   - Channel (megagroup=True) → супергруппа → InputChannel + InviteToChannelRequest
+        #   - Channel (broadcast=True) → канал → инвайт запрещён
+        #   - Chat (legacy)            → обычная группа → InputPeerChat + AddChatUserRequest
+        #   - ChatForbidden            → нет доступа
+        #   - ChannelForbidden         → нет доступа
         from telethon.tl.types import (
+            Channel as TlChannel,
+            Chat as TlChat,
+            ChatForbidden as TlChatForbidden,
+            ChannelForbidden as TlChannelForbidden,
             InputChannel as TlInputChannel,
             InputPeerChannel as TlInputPeerChannel,
+            InputPeerChat as TlInputPeerChat,
         )
-        if isinstance(input_channel, TlInputPeerChannel):
-            # Преобразуем InputPeerChannel → InputChannel
-            input_channel = TlInputChannel(
-                channel_id=input_channel.channel_id,
-                access_hash=input_channel.access_hash,
-            )
-            self.log_invite(f"✅ InputChannel получен (id={input_channel.channel_id})", "info")
-        elif isinstance(input_channel, TlInputChannel):
-            self.log_invite(f"✅ InputChannel получен (id={input_channel.channel_id})", "info")
-        else:
-            # Для обычных чатов (Chat) нужен другой подход — через InputPeerChat
+
+        # Сбрасываем состояние (могло остаться от предыдущего инвайта)
+        self._invite_target_type = None
+        self._invite_input_channel = None
+        self._invite_chat_id = None
+
+        try:
+            input_entity = await primary.client.get_input_entity(group)
+        except Exception as e:
+            self.log_invite(f"❌ Не удалось получить input entity: {e}", "error")
+            return
+
+        # Логируем тип для отладки
+        group_type_name = type(group).__name__
+        input_type_name = type(input_entity).__name__
+        self.log_invite(f"ℹ️ Тип группы: {group_type_name}, input: {input_type_name}", "info")
+
+        # Анализируем тип группы
+        if isinstance(group, TlChannelForbidden):
+            self.log_invite("❌ Это ChannelForbidden — нет доступа к группе", "error")
+            return
+        if isinstance(group, TlChatForbidden):
+            self.log_invite("❌ Это ChatForbidden — нет доступа к чату", "error")
+            return
+
+        if isinstance(group, TlChannel):
+            # Это супергруппа или канал
+            is_megagroup = getattr(group, "megagroup", False)
+            is_broadcast = getattr(group, "broadcast", False)
+            if is_broadcast and not is_megagroup:
+                self.log_invite(
+                    "🛑 Это broadcast-канал! Инвайт в каналы запрещён (только админы могут добавлять).",
+                    "error",
+                )
+                self.invite_stop.set()
+                return
+            # Получаем InputChannel
+            if isinstance(input_entity, TlInputPeerChannel):
+                self._invite_input_channel = TlInputChannel(
+                    channel_id=input_entity.channel_id,
+                    access_hash=input_entity.access_hash,
+                )
+            elif isinstance(input_entity, TlInputChannel):
+                self._invite_input_channel = input_entity
+            else:
+                # Попытка через group.id + access_hash
+                access_hash = getattr(group, "access_hash", None)
+                if access_hash:
+                    self._invite_input_channel = TlInputChannel(
+                        channel_id=group.id,
+                        access_hash=access_hash,
+                    )
+                else:
+                    self.log_invite(
+                        f"❌ Не удалось получить access_hash для канала (input: {input_type_name})",
+                        "error",
+                    )
+                    return
+            self._invite_target_type = "channel"
             self.log_invite(
-                f"⚠️ Целевая группа — это обычный чат (не супергруппа/канал). "
-                f"Инвайт работает только в супергруппы/каналы. "
-                f"Тип: {type(input_channel).__name__}",
-                "warning",
+                f"✅ Супergroup (id={self._invite_input_channel.channel_id})",
+                "success",
             )
 
-        # [NEW] Проверка типа группы и прав аккаунта
+        elif isinstance(group, TlChat):
+            # Это обычный чат (legacy) — нужен AddChatUserRequest
+            self._invite_chat_id = group.id
+            self._invite_target_type = "chat"
+            self.log_invite(
+                f"ℹ️ Это обычный чат (chat_id={group.id}). "
+                f"Будет использован AddChatUserRequest вместо InviteToChannelRequest.",
+                "info",
+            )
+            # Если чат мигрирован в супергруппу — лучше использовать её
+            migrated_to = getattr(group, "migrated_to", None)
+            if migrated_to:
+                self.log_invite(
+                    f"⚠️ Чат мигрировал в супергруппу. Попробуйте ссылку на новую супергруппу.",
+                    "warning",
+                )
+        else:
+            self.log_invite(
+                f"❌ Неизвестный тип группы: {group_type_name}",
+                "error",
+            )
+            return
+
+        # [NEW] Проверка прав аккаунта
         await self._check_group_permissions(primary.client, group, primary)
 
         if self.invite_stop.is_set():
-            # Остановка произошла в _check_group_permissions (нет прав / это канал)
             return
 
         if self.skip_duplicates_var.get() and not self.dry_run:
@@ -3457,7 +3530,29 @@ class TelegramWorkingInvite:
                     consecutive_errors = max(0, consecutive_errors - 1)
                     continue
 
-                await client(InviteToChannelRequest(channel=input_channel, users=[user_entity]))
+                # [NEW] Выбираем метод в зависимости от типа группы
+                if self._invite_target_type == "channel" and self._invite_input_channel:
+                    # Супергруппа — InviteToChannelRequest
+                    await client(InviteToChannelRequest(
+                        channel=self._invite_input_channel,
+                        users=[user_entity],
+                    ))
+                elif self._invite_target_type == "chat" and self._invite_chat_id:
+                    # Обычный чат (legacy) — AddChatUserRequest
+                    from telethon.tl.functions.messages import AddChatUserRequest
+                    await client(AddChatUserRequest(
+                        chat_id=self._invite_chat_id,
+                        user_id=user_entity,
+                        fwd_limit=0,
+                    ))
+                else:
+                    self._handle_invite_error(
+                        user, info, "Нет цели",
+                        "не определён тип целевой группы"
+                    )
+                    consecutive_errors += 1
+                    continue
+
                 self.stats.successful += 1
                 info.invited_count += 1
                 user.status = "✅ Приглашён"
@@ -3592,46 +3687,55 @@ class TelegramWorkingInvite:
         2. Broadcast-канал — в каналах инвайт запрещён вообще
 
         Если проверка не проходит — ставит invite_stop и логирует понятное сообщение.
+        Также использует self._invite_input_channel (InputChannel) для GetParticipantRequest,
+        чтобы избежать 'Invalid channel object' ошибки.
         """
         try:
             from telethon.tl.types import Channel as TlChannel, Chat as TlChat
 
-            # Проверяем тип сущности
-            is_channel = False
-            is_broadcast = False
-            if isinstance(group, TlChannel):
-                is_channel = True
-                # broadcast = канал (только админы пишут), megagroup = супергруппа
-                is_broadcast = not getattr(group, "megagroup", False)
-
-            if is_broadcast:
+            # Для обычного чата (Chat) права не проверяем — AddChatUserRequest
+            # работает по другим правилам (любой участник может добавить)
+            if isinstance(group, TlChat):
                 self.log_invite(
-                    "🛑 ЦЕЛЕВАЯ ГРУППА — ЭТО КАНАЛ (broadcast)!\n"
-                    "   В каналах приглашать пользователей могут только админы.\n"
-                    "   Для инвайта нужна СУПЕРГРУППА (megagroup), а не канал.\n"
-                    "   Создайте супергруппу или получите права админа в существующей.",
-                    "error",
+                    f"ℹ️ [{info.me_name or 'account'}] Обычный чат — "
+                    f"права не проверяются (AddChatUserRequest работает для участников)",
+                    "info",
                 )
-                self.invite_stop.set()
                 return
 
+            # Проверяем broadcast (канал)
+            if isinstance(group, TlChannel):
+                is_broadcast = not getattr(group, "megagroup", False)
+                if is_broadcast:
+                    self.log_invite(
+                        "🛑 ЦЕЛЕВАЯ ГРУППА — ЭТО КАНАЛ (broadcast)!\n"
+                        "   В каналах приглашать пользователей могут только админы.\n"
+                        "   Для инвайта нужна СУПЕРГРУППА (megagroup), а не канал.\n"
+                        "   Создайте супергруппу или получите права админа в существующей.",
+                        "error",
+                    )
+                    self.invite_stop.set()
+                    return
+
             # Проверяем, является ли аккаунт админом с правом приглашать
-            # Telethon: GetParticipantRequest вернёт ParticipantAdmin / ParticipantNormal
+            # Используем InputChannel (self._invite_input_channel) — иначе 'Invalid channel'
             try:
                 from telethon.tl.functions.channels import GetParticipantRequest
                 from telethon.tl.types import (
                     ChannelParticipantAdmin, ChannelParticipantCreator,
                 )
                 me = await client.get_me()
+
+                # Используем InputChannel, не group
+                channel_param = self._invite_input_channel if self._invite_input_channel else group
                 result = await client(GetParticipantRequest(
-                    channel=group, user_id=me.id
+                    channel=channel_param, user_id=me.id
                 ))
                 participant = result.participant
                 is_admin = isinstance(participant, (ChannelParticipantAdmin, ChannelParticipantCreator))
 
                 if is_admin:
                     # Проверяем конкретное право "invite_users"
-                    # У ChannelParticipantAdmin есть admin_rights с полем invite_users
                     admin_rights = getattr(participant, "admin_rights", None)
                     if admin_rights:
                         can_invite = getattr(admin_rights, "invite_users", False)
@@ -3641,7 +3745,6 @@ class TelegramWorkingInvite:
                                 f"   Нужно дать право 'invite_users' в настройках админа.",
                                 "warning",
                             )
-                            # Не останавливаем — может быть, права менялись
                         else:
                             self.log_invite(
                                 f"✅ [{info.me_name or 'account'}] Админ с правом инвайта",
@@ -3655,7 +3758,6 @@ class TelegramWorkingInvite:
                         )
                 else:
                     # Не админ — в супергруппе участники могут приглашать если не запрещено
-                    # Но в большинстве случаев без прав инвайта будет ошибка
                     self.log_invite(
                         f"⚠️ [{info.me_name or 'account'}] НЕ админ в этой группе!\n"
                         f"   Инвайт может не сработать. Дайте аккаунту права админа\n"
@@ -3664,8 +3766,9 @@ class TelegramWorkingInvite:
                     )
             except Exception as e:
                 # Не критично — продолжаем, ошибка всплывёт при инвайте
+                err_str = str(e)
                 self.log_invite(
-                    f"ℹ️ Не удалось проверить права (не критично): {e}",
+                    f"ℹ️ Не удалось проверить права (не критично): {err_str[:80]}",
                     "info",
                 )
 
