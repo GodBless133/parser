@@ -162,6 +162,7 @@ class UserData:
     status: str = "Готов"
     last_seen: Optional[str] = None
     is_bot: bool = False
+    access_hash: Optional[int] = None  # [NEW] критично для инвайта по user_id
 
     def to_csv_row(self) -> Dict[str, Any]:
         return {
@@ -169,6 +170,7 @@ class UserData:
             "first_name": self.first_name or "", "last_name": self.last_name or "",
             "phone": self.phone or "", "status": self.status,
             "last_seen": self.last_seen or "",
+            "access_hash": self.access_hash or "",
         }
 
 
@@ -2469,12 +2471,16 @@ class TelegramWorkingInvite:
         was_online = getattr(status, "was_online", None) if status else None
         if was_online:
             last_seen_str = was_online.strftime("%Y-%m-%d %H:%M:%S")
+        # [NEW] Сохраняем access_hash — критично для инвайта по user_id
+        # Без access_hash Telethon не может создать InputEntity -> "Could not find the input entity"
+        access_hash = getattr(user, "access_hash", None)
         return UserData(
             id=user.id, username=user.username or "",
             first_name=user.first_name or "", last_name=user.last_name or "",
             phone=getattr(user, "phone", "") or "",
             status="Готов", last_seen=last_seen_str,
             is_bot=bool(user.bot),
+            access_hash=int(access_hash) if access_hash else None,
         )
 
     def _update_users_table(self) -> None:
@@ -2580,6 +2586,12 @@ class TelegramWorkingInvite:
             with open(filename, "r", encoding="utf-8-sig") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
+                    # access_hash — опциональное поле (для обратной совместимости со старыми CSV)
+                    access_hash_str = row.get("access_hash", "").strip()
+                    try:
+                        access_hash = int(access_hash_str) if access_hash_str else None
+                    except ValueError:
+                        access_hash = None
                     imported.append(UserData(
                         id=int(row["id"]),
                         username=row.get("username", ""),
@@ -2588,6 +2600,7 @@ class TelegramWorkingInvite:
                         phone=row.get("phone", ""),
                         status=row.get("status", "Готов"),
                         last_seen=row.get("last_seen") or None,
+                        access_hash=access_hash,
                     ))
             self.parsed_users = imported
             self._update_users_table()
@@ -2759,6 +2772,13 @@ class TelegramWorkingInvite:
             self.log_invite(f"❌ Не удалось получить группу: {e}", "error")
             return
 
+        # [NEW] Проверка типа группы и прав аккаунта
+        await self._check_group_permissions(primary.client, group, primary)
+
+        if self.invite_stop.is_set():
+            # Остановка произошла в _check_group_permissions (нет прав / это канал)
+            return
+
         if self.skip_duplicates_var.get() and not self.dry_run:
             self.log_invite("🔄 Загружаю участников группы...", "info")
             try:
@@ -2840,7 +2860,19 @@ class TelegramWorkingInvite:
                 continue
 
             try:
-                user_entity = await client.get_input_entity(user.id)
+                # [NEW] Создаём InputUser напрямую с access_hash
+                # Это решает ошибку "Could not find the input entity for PeerUser"
+                user_entity = await self._get_input_user(client, user)
+                if user_entity is None:
+                    self._handle_invite_error(
+                        user, info, "Нет access_hash",
+                        "пользователь не в кэше — пропустите или пригласите по @username"
+                    )
+                    consecutive_errors += 1
+                    # Не считаем как критическую ошибку для автоостановки
+                    consecutive_errors = max(0, consecutive_errors - 1)
+                    continue
+
                 await client(InviteToChannelRequest(channel=group, users=[user_entity]))
                 self.stats.successful += 1
                 info.invited_count += 1
@@ -2879,9 +2911,48 @@ class TelegramWorkingInvite:
                 self._handle_invite_error(user, info, "AuthKey", "отозвана")
                 info.is_authorized = False
                 self.root.after(0, self.refresh_accounts_table)
-            except Exception as e:
-                self._handle_invite_error(user, info, "Ошибка", str(e)[:120])
+            except ChatWriteForbiddenError:
+                # "You can't write in this chat" — аккаунт не админ / это канал
+                self._handle_invite_error(
+                    user, info, "Нет прав",
+                    "у аккаунта нет прав приглашать в эту группу"
+                )
+                self.log_invite(
+                    f"🛑 [{label}] Нет прав на инвайт! Проверьте, что аккаунт — админ "
+                    f"с правом 'Добавление пользователей'",
+                    "error",
+                )
                 consecutive_errors += 1
+            except ChatAdminInviteRequiredError:
+                self._handle_invite_error(
+                    user, info, "Нужен админ",
+                    "в этой группе инвайт только для админов"
+                )
+                consecutive_errors += 1
+            except BroadcastForbiddenError:
+                self._handle_invite_error(
+                    user, info, "Это канал",
+                    "это broadcast-канал — в каналах инвайт запрещён"
+                )
+                self.log_invite(
+                    f"🛑 Целевая группа — broadcast-канал! Инвайт невозможен. "
+                    f"Используйте супергруппу.",
+                    "error",
+                )
+                # Останавливаем — нет смысла продолжать
+                self.invite_stop.set()
+                break
+            except Exception as e:
+                err_str = str(e)
+                # Обрабатываем "You can't write in this chat" как ChatWriteForbidden
+                if "can't write in this chat" in err_str.lower():
+                    self._handle_invite_error(
+                        user, info, "Нет прав", "у аккаунта нет прав приглашать"
+                    )
+                    consecutive_errors += 1
+                else:
+                    self._handle_invite_error(user, info, "Ошибка", err_str[:120])
+                    consecutive_errors += 1
 
             if consecutive_errors >= MAX_ERRORS:
                 self.log_invite(f"🛑 {MAX_ERRORS} ошибок подряд — автоостановка", "error")
@@ -2913,6 +2984,130 @@ class TelegramWorkingInvite:
                         break
 
         await self._generate_final_report()
+
+    async def _check_group_permissions(self, client: TelegramClient, group, info: AccountRuntimeInfo) -> None:
+        """Предварительная проверка типа группы и прав аккаунта.
+
+        Решает две проблемы из лога пользователя:
+        1. "You can't write in this chat" — аккаунт не админ в супергруппе
+        2. Broadcast-канал — в каналах инвайт запрещён вообще
+
+        Если проверка не проходит — ставит invite_stop и логирует понятное сообщение.
+        """
+        try:
+            from telethon.tl.types import Channel as TlChannel, Chat as TlChat
+
+            # Проверяем тип сущности
+            is_channel = False
+            is_broadcast = False
+            if isinstance(group, TlChannel):
+                is_channel = True
+                # broadcast = канал (только админы пишут), megagroup = супергруппа
+                is_broadcast = not getattr(group, "megagroup", False)
+
+            if is_broadcast:
+                self.log_invite(
+                    "🛑 ЦЕЛЕВАЯ ГРУППА — ЭТО КАНАЛ (broadcast)!\n"
+                    "   В каналах приглашать пользователей могут только админы.\n"
+                    "   Для инвайта нужна СУПЕРГРУППА (megagroup), а не канал.\n"
+                    "   Создайте супергруппу или получите права админа в существующей.",
+                    "error",
+                )
+                self.invite_stop.set()
+                return
+
+            # Проверяем, является ли аккаунт админом с правом приглашать
+            # Telethon: GetParticipantRequest вернёт ParticipantAdmin / ParticipantNormal
+            try:
+                from telethon.tl.functions.channels import GetParticipantRequest
+                from telethon.tl.types import (
+                    ChannelParticipantAdmin, ChannelParticipantCreator,
+                )
+                me = await client.get_me()
+                result = await client(GetParticipantRequest(
+                    channel=group, user_id=me.id
+                ))
+                participant = result.participant
+                is_admin = isinstance(participant, (ChannelParticipantAdmin, ChannelParticipantCreator))
+
+                if is_admin:
+                    # Проверяем конкретное право "invite_users"
+                    # У ChannelParticipantAdmin есть admin_rights с полем invite_users
+                    admin_rights = getattr(participant, "admin_rights", None)
+                    if admin_rights:
+                        can_invite = getattr(admin_rights, "invite_users", False)
+                        if not can_invite:
+                            self.log_invite(
+                                f"⚠️ [{info.me_name or 'account'}] Админ, но БЕЗ права 'Добавление пользователей'!\n"
+                                f"   Нужно дать право 'invite_users' в настройках админа.",
+                                "warning",
+                            )
+                            # Не останавливаем — может быть, права менялись
+                        else:
+                            self.log_invite(
+                                f"✅ [{info.me_name or 'account'}] Админ с правом инвайта",
+                                "success",
+                            )
+                    else:
+                        # Creator имеет все права
+                        self.log_invite(
+                            f"✅ [{info.me_name or 'account'}] Создатель группы",
+                            "success",
+                        )
+                else:
+                    # Не админ — в супергруппе участники могут приглашать если не запрещено
+                    # Но в большинстве случаев без прав инвайта будет ошибка
+                    self.log_invite(
+                        f"⚠️ [{info.me_name or 'account'}] НЕ админ в этой группе!\n"
+                        f"   Инвайт может не сработать. Дайте аккаунту права админа\n"
+                        f"   с правом 'Добавление пользователей'.",
+                        "warning",
+                    )
+            except Exception as e:
+                # Не критично — продолжаем, ошибка всплывёт при инвайте
+                self.log_invite(
+                    f"ℹ️ Не удалось проверить права (не критично): {e}",
+                    "info",
+                )
+
+        except Exception as e:
+            self.log_invite(f"⚠️ Ошибка проверки прав: {e}", "warning")
+
+    async def _get_input_user(self, client: TelegramClient, user: UserData):
+        """Получить InputUser для инвайта.
+
+        Решает проблему "Could not find the input entity for PeerUser":
+        1. Используем сохранённый access_hash (главный путь)
+        2. Если access_hash есть — создаём InputUser напрямую
+        3. Если нет — пробуем get_input_entity (работает для контактов)
+        4. Если есть username — пробуем через него
+        5. Иначе возвращаем None
+        """
+        from telethon.tl.types import InputUser
+        from telethon.errors import PeerIdInvalidError
+
+        # Путь 1: есть access_hash — создаём InputUser напрямую
+        if user.access_hash:
+            try:
+                return InputUser(user_id=user.id, access_hash=user.access_hash)
+            except Exception:
+                pass
+
+        # Путь 2: пробуем get_input_entity (работает для пользователей в кэше сессии)
+        try:
+            return await client.get_input_entity(user.id)
+        except Exception:
+            pass
+
+        # Путь 3: пробуем через username
+        if user.username:
+            try:
+                return await client.get_input_entity(user.username)
+            except Exception:
+                pass
+
+        # Ничего не сработало
+        return None
 
     def _handle_invite_error(self, user, info, error_type, error_msg):
         user.status = f"❌ {error_type}"
